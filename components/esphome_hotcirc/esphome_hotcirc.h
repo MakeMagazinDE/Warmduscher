@@ -1,0 +1,255 @@
+#pragma once
+#include "esphome/core/component.h"
+#include "esphome/core/preferences.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/switch/switch.h"
+#include "esphome/components/time/real_time_clock.h"
+#include "esphome/components/output/binary_output.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
+
+namespace esphome {
+namespace esphome_hotcirc {
+
+// Structure for storing learning matrix in flash.
+// FIX #11: magic + version field added. Detecting an old 24-slot layout via a
+// plain additive checksum was unreliable (sums can collide); an explicit magic
+// word makes format detection deterministic. Note: changing the struct size
+// also changes the NVS key hash, so existing saved matrices are invalidated
+// once after this update (the default pattern is re-initialized).
+struct LearnMatrixData {
+  uint32_t magic;        // Must equal MATRIX_MAGIC
+  uint8_t version;       // Layout version, currently MATRIX_VERSION
+  uint8_t reserved[3];   // Padding/alignment, keep zeroed
+  uint8_t learn[7][48];  // 48 half-hourly slots
+  uint32_t checksum;     // Additive checksum over learn[][]
+};
+
+class HotWaterController : public Component {
+ public:
+  static constexpr uint32_t MATRIX_MAGIC = 0x48435231;  // "HCR1"
+  static constexpr uint8_t MATRIX_VERSION = 2;          // 2 = 48-slot layout
+
+  // Pump trigger types - defines what caused the pump to start
+  enum class PumpTrigger {
+    NONE,              // Pump not running
+    MANUAL_BUTTON,     // Started by hardware button
+    MANUAL_WEBUI,      // Started by Web UI button
+    WATER_DRAW,        // Started by detected water usage
+    SCHEDULED,         // Started by learning/schedule
+    DISINFECTION,      // Started by disinfection cycle detection
+    ANTI_STAGNATION,   // Started by anti-stagnation (prevents pump seizure)
+    THERMAL_STAGNATION // Started because return temp >= outlet temp (summer heat soak)
+  };
+
+  // Sensors & actuators
+  sensor::Sensor *outlet_{nullptr};
+  sensor::Sensor *ret_{nullptr};
+  switch_::Switch *pump_{nullptr};
+  time::RealTimeClock *clock_{nullptr};
+  binary_sensor::BinarySensor *button_{nullptr};
+  output::BinaryOutput *led_green_{nullptr};
+  output::BinaryOutput *led_yellow_{nullptr};
+
+  // Configuration setters
+  void set_outlet_sensor(sensor::Sensor *s) { outlet_ = s; }
+  void set_return_sensor(sensor::Sensor *s) { ret_ = s; }
+  void set_pump_switch(switch_::Switch *s) { pump_ = s; }
+  void set_time_source(time::RealTimeClock *t) { clock_ = t; }
+  void set_led_green(output::BinaryOutput *led) { led_green_ = led; }
+  void set_led_yellow(output::BinaryOutput *led) { led_yellow_ = led; }
+  void set_button(binary_sensor::BinarySensor *btn) { button_ = btn; }
+
+  void set_thresholds(float outlet_rise_deg, float return_rise_deg, float disinfection_temp_rise, float min_return_temp) {
+    this->temp_rise_threshold_ = outlet_rise_deg;
+    this->return_rise_threshold_ = return_rise_deg;
+    this->disinfection_temp_threshold_ = disinfection_temp_rise;
+    this->min_return_temp_ = min_return_temp;
+  }
+
+  void set_pump_flow_rate(float flow_rate_lpm) {
+    this->pump_flow_rate_ = flow_rate_lpm;
+  }
+
+  // FIX #6: DEPRECATED / unused. Anti-stagnation runs on a fixed weekly
+  // schedule (Sunday 03:00, see check_anti_stagnation_()); this interval is
+  // no longer evaluated. Setter kept only so existing YAMLs of other variants
+  // still validate. Remove together with the schema entry in a future release.
+  void set_anti_stagnation_interval(uint32_t interval_seconds) {
+    this->ANTI_STAGNATION_INTERVAL = interval_seconds;
+  }
+
+  void set_anti_stagnation_runtime(uint32_t runtime_seconds) {
+    this->ANTI_STAGNATION_RUNTIME = runtime_seconds;
+  }
+
+  void set_thermal_stagnation_runtime(uint32_t runtime_seconds) {
+    this->THERMAL_STAGNATION_RUNTIME = runtime_seconds;
+  }
+
+  void set_thermal_stagnation_cooldown(uint32_t cooldown_seconds) {
+    this->THERMAL_STAGNATION_COOLDOWN = cooldown_seconds;
+  }
+
+  void set_thermal_stagnation_delta(float delta_deg) {
+    this->thermal_stagnation_delta_ = delta_deg;
+  }
+
+  void set_thermal_stagnation_min_return(float min_return_deg) {
+    this->thermal_stagnation_min_return_ = min_return_deg;
+  }
+
+  float get_last_cycle_energy() const {
+    return last_cycle_energy_;
+  }
+
+  uint32_t get_last_cycle_duration() const {
+    return last_cycle_duration_;
+  }
+
+  bool is_vacation_mode() const {
+    return vacation_mode_;
+  }
+
+  PumpTrigger get_pump_trigger() const {
+    return pump_trigger_;
+  }
+
+  // FIX #7: Single source of truth for trigger names. Used by run_pump()
+  // logging AND the YAML "Pump Status" text sensor - previously three
+  // hand-written copies had already drifted ("Schedule" vs "Scheduled").
+  const char *get_pump_trigger_str() const { return trigger_to_str_(pump_trigger_); }
+  static const char *trigger_to_str_(PumpTrigger t);
+
+  // Parameters (configurable)
+  // FIX #9: default aligned with the shipped YAML (1.0 °C, reduced from 1.5
+  // to match the slower temperature response of the 40 cm sensor pipe).
+  float temp_rise_threshold_{1.0f};      // Minimum temperature rise to detect draw
+  float return_rise_threshold_{5.0f};    // Target return temperature rise
+  float disinfection_temp_threshold_{10.0f};  // Temp rise above baseline indicating disinfection cycle
+  float min_return_temp_{30.0f};         // Minimum return temp to start pump (water already hot enough)
+  float pump_flow_rate_{20.0f};          // Pump flow rate in liters per minute (L/min)
+  uint32_t MIN_RUN_TIME = 30;            // Minimum pump run time (seconds)
+  uint32_t MAX_RUN_TIME = 480;           // Maximum pump run time (seconds)
+  uint32_t MINIMUM_DRAW_DURATION = 15000; // 15 seconds in milliseconds
+  uint32_t USER_REQUEST_MAX_AGE = 1800;  // 30 minutes
+  uint32_t DISINFECTION_COOLDOWN = 3600; // 1 hour cooldown before re-detecting disinfection (seconds)
+  uint32_t ANTI_STAGNATION_INTERVAL = 172800; // DEPRECATED - unused, see set_anti_stagnation_interval()
+  uint32_t ANTI_STAGNATION_RUNTIME = 15;     // Anti-stagnation run time (seconds)
+  uint32_t THERMAL_STAGNATION_RUNTIME = 10;  // Thermal stagnation flush run time (seconds)
+  uint32_t THERMAL_STAGNATION_COOLDOWN = 1800; // 30 min cooldown between thermal stagnation runs
+  float    thermal_stagnation_delta_{2.0f};  // outlet - return < this value (°C) triggers flush
+  float    thermal_stagnation_min_return_{40.0f}; // return must be >= this (°C) to trigger flush
+  uint8_t LEARN_INC = 40;                // Learning increment per detection
+  uint8_t SCHEDULE_THRESHOLD = 120;      // Threshold to trigger scheduled run
+  float DECAY = 0.98f;                   // Daily decay factor for learning matrix
+
+  // Learning matrix [day_of_week][half_hour_slot]
+  // Slots: 0=00:00-00:29, 1=00:30-00:59, 2=01:00-01:29, ..., 47=23:30-23:59
+  uint8_t learn_[7][48] = {0};
+  uint32_t last_decay_day_ = 0;
+
+  // Water draw detection state (tracks sustained temperature RISE)
+  float last_outlet_value_{NAN};
+  uint32_t last_outlet_check_{0};
+  uint32_t draw_detection_started_{0};   // Timestamp when potential draw started
+  bool draw_detected_{false};            // Flag to prevent multiple triggers
+  float initial_draw_temp_{NAN};         // Temperature when draw detection started
+  float baseline_outlet_{NAN};           // Baseline outlet temp for disinfection detection
+  time_t last_water_draw_time_{0};       // Timestamp of last detected water draw
+  bool vacation_mode_{false};            // True when no water draw for 24h
+  bool draw_pending_{false};             // True in case potential water draw detected (read by GUI)
+
+  // Pump control state
+  bool pump_running_{false};
+  bool disinfection_mode_{false};        // Flag when disinfection cycle detected
+  PumpTrigger pump_trigger_{PumpTrigger::NONE};  // What triggered the current pump run
+  time_t last_disinfection_start_{0};    // Timestamp of last disinfection cycle start (prevents re-trigger)
+  time_t last_anti_stagnation_run_{0};   // Timestamp of last anti-stagnation run
+  uint32_t thermal_stagnation_started_{0}; // millis() when condition first met (0 = not pending)
+  time_t   last_thermal_stagnation_run_{0}; // epoch timestamp of last thermal stagnation run
+  float baseline_return_{NAN};
+  // FIX (millis-Rollover): internal timing uses a millisecond base whose
+  // unsigned difference is wrap-safe. pump_start_ (seconds) is kept updated
+  // for backward compatibility (GUI package may read it).
+  uint32_t pump_start_ms_{0};            // millis() at pump start (wrap-safe reference)
+  uint32_t pump_start_{0};               // pump_start_ms_ / 1000 (compatibility only)
+  time_t last_run_epoch_ = 0;            // 0 = unknown (clock invalid at last stop)
+
+  // Energy tracking for current/last pump cycle
+  float energy_sum_{0.0f};               // Accumulated energy during current cycle (Wh)
+  uint32_t energy_samples_{0};           // Number of samples taken
+  uint32_t last_energy_calc_time_{0};    // Last time energy was calculated (millis)
+  float last_cycle_energy_{0.0f};        // Energy consumed in last completed cycle (kWh)
+  uint32_t last_cycle_duration_{0};      // Duration of last cycle (seconds)
+
+  // UI state
+  uint32_t yellow_led_on_until_{0};      // Compared wrap-safe via signed diff in update_leds()
+  bool learning_enabled_{true};
+  bool pump_enabled_{true};  // Master enable/disable for pump operation
+  bool button_last_{false};
+  uint32_t button_pressed_since_{0};
+
+  // FIX #4: non-blocking LED flash after matrix reset (was 6x delay(200)
+  // = 1.2 s blocking loop() stall). Driven from update_leds().
+  uint8_t led_flash_remaining_{0};       // Toggles left in the flash sequence
+  uint32_t led_flash_next_ms_{0};        // millis() deadline for next toggle
+
+  // Scheduled trigger tracking (prevents re-triggering same 30-min slot)
+  int last_scheduled_day_{-1};   // Last day when scheduled trigger fired
+  int last_scheduled_slot_{-1};  // Last 30-min slot when scheduled trigger fired
+
+  // Flash storage
+  ESPPreferenceObject pref_;
+
+  void setup() override;
+  void loop() override;
+
+  // Public control methods (callable from YAML)
+  void manual_pump_on() {
+    run_pump(PumpTrigger::MANUAL_WEBUI);
+  }
+
+  void manual_pump_off() {
+    stop_pump("Manual stop (Web UI)");
+  }
+
+  void enable_pump();
+
+  void disable_pump();
+
+  // Save learning matrix to flash (callable from YAML button)
+  void save_learning_matrix();
+
+  void run_pump(PumpTrigger trigger = PumpTrigger::MANUAL_BUTTON);
+  void stop_pump(const char *reason);
+
+ protected:
+  // FIX #10: the deprecated poll-based detect_water_draw() has been removed
+  // entirely (history lives in Git). Detection runs exclusively in
+  // on_outlet_sample_(), fed by the outlet sensor's publish callback and
+  // therefore immune to loop() starvation on the display node.
+  void on_outlet_sample_(float t_now);
+  void reset_water_draw_detection_();    // Resets draw detection state
+  void detect_disinfection_cycle_();     // Detects boiler disinfection by monitoring outlet temp
+  void check_vacation_mode_();           // Check if entering/exiting vacation mode
+  void check_anti_stagnation_();         // Check if anti-stagnation run is needed
+  void check_thermal_stagnation_();      // Check if return >= outlet (summer heat soak flush)
+  void handle_user_request();
+  void learn_now();
+  void decay_table();
+  void save_learning_matrix_();          // Save learning matrix to flash
+  void load_learning_matrix_();          // Load learning matrix from flash
+  void init_default_pattern_();          // FIX #11: single helper for the typical daily pattern
+  uint32_t calculate_checksum_() const;  // Checksum over learn_[][]
+  static uint32_t calculate_checksum_(const uint8_t (&m)[7][48]);  // Checksum over arbitrary matrix
+  void reset_learning_matrix_();         // Reset learning matrix (10+ sec button press)
+  void check_schedule();
+  void pump_control();
+  void handle_button();
+  void toggle_learning();
+  void update_leds();
+  void log_learning_matrix_();
+};
+
+}  // namespace esphome_hotcirc
+}  // namespace esphome
